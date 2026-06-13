@@ -21,6 +21,8 @@ Delayed scheduling · Atomic job locking · Exponential backoff · CPU thread is
 
 Most apps don't need Redis. They need a reliable way to run background jobs without spinning up external services, managing connections, or paying for more infrastructure.
 
+Every external dependency adds network round-trips, connection pooling overhead, and a new failure domain. LiteQ eliminates all of it — your queue runs in-process with SQLite as a local file. No TCP connections, no serialization hops, no dropped connections to retry.
+
 LiteQ uses SQLite as a persistent state machine. Jobs survive crashes, restarts, and deploys. Workers are isolated. Retries are automatic. And the entire thing is a single `npm install`.
 
 ```
@@ -33,10 +35,10 @@ Your App
               ▼
         SQLite (WAL mode)
               │
-        ┌─────┴──────┐
-        │            │
-      pending  →  processing  →  completed
-                               └→ failed (after retries exhausted)
+        ┌─────┴─────────┐
+        │               │
+     pending  →  processing  →  completed
+                             └→ failed (after retries exhausted)
 ```
 
 ---
@@ -58,7 +60,7 @@ import { LiteQ } from 'liteq';
 
 const queue = new LiteQ({ storagePath: './jobs.db' });
 
-// Register a handler — returns a typed enqueuer function
+// Register an I/O handler — returns a typed enqueuer function
 const sendEmail = queue.register<{ to: string; subject: string }>(
     'send-email',
     async (job) => {
@@ -67,14 +69,18 @@ const sendEmail = queue.register<{ to: string; subject: string }>(
     }
 );
 
+// Register a CPU handler — runs in a dedicated worker thread
+const generatePdf = queue.register('generate-pdf', './workers/pdf-worker.js');
+
 // Start the polling engine
 await queue.start();
 
-// Call the enqueuer from anywhere in your app — fully typed, no raw strings
+// Call the enqueuer from anywhere — fully typed, no raw strings
 await sendEmail({ to: 'user@example.com', subject: 'Welcome!' });
+await generatePdf({ orderId: 'ord_123' });
 ```
 
-The string `'send-email'` is written **once** inside `register()`. The returned function is typed to your payload — no magic strings, no mismatches, no silent failures.
+The string `'send-email'` is written **once** inside `register()`. The returned function is typed to your payload — no magic strings, no mismatches.
 
 ---
 
@@ -84,17 +90,36 @@ The string `'send-email'` is written **once** inside `register()`. The returned 
 
 | Step | What Happens |
 |---|---|
-| **Register** | `queue.register()` stores the handler in memory and returns a typed enqueuer function |
-| **Enqueue** | Calling the enqueuer writes a row to SQLite with `status = 'pending'` |
-| **Poll** | `queue.start()` begins querying the DB on a configurable interval |
-| **Claim** | A worker atomically shifts the row to `'processing'` using `BEGIN IMMEDIATE TRANSACTION` — no two workers ever claim the same job |
-| **Success** | Status shifts to `'completed'` |
-| **Failure** | Status returns to `'pending'`, attempts increment, `run_at` bumps with exponential backoff |
-| **Dead** | After `max_retries` exhausted, status shifts to `'failed'` |
+| **Register** | `queue.register()` stores the handler and determines the execution type: **I/O** (function arg) or **CPU** (string path arg). Returns a typed enqueuer. |
+| **Enqueue** | Calling the enqueuer writes a row to SQLite with status `'pending'` and the execution type (`'io'` or `'worker'`). |
+| **Poll** | `queue.start()` polls every `pollInterval` ms, running `tryClaimIo()` and `tryClaimCpu()` independently. |
+| **Claim — I/O** | `tryClaimIo()` claims jobs where `type = 'io'`, gated by the `concurrency` counter. The handler runs directly on the main thread. |
+| **Claim — CPU** | `tryClaimCpu()` claims jobs where `type = 'worker'`, gated by the pool's `canAccept` (idle worker or room to spawn). Dispatched to a generic worker thread. |
+| **Success** | Status shifts to `'completed'`. |
+| **Failure** | Status returns to `'pending'`, attempts increment, `run_at` bumps with exponential backoff. |
+| **Dead** | After `max_retries` exhausted, status shifts to `'failed'`. |
+
+I/O and CPU jobs never block each other — they use independent concurrency controls.
+
+### The Generic Worker Pool
+
+CPU-bound jobs run in a pool of reusable worker threads. The pool is not coupled to handler paths — any idle worker can dynamically import and run any handler module.
+
+```
+pool.execute(handlerPath, job)
+       │
+       ├── idle worker? → dispatch(worker, handlerPath, job)
+       │
+       ├── room to spawn? → spawn() → dispatch(newWorker, handlerPath, job)
+       │
+       └── busy + at maxWorkers → queue internally → (dispatched when a worker frees)
+```
+
+When a job completes, the worker is marked idle and the pool drains its internal queue. Excess idle workers above `minWorkers` are automatically trimmed.
 
 ### Crash Recovery
 
-When your app crashes mid-job, SQLite survives. On restart, any job stuck in `'processing'` beyond `jobTimeout` is automatically returned to `'pending'` and retried. **No job is ever silently lost.**
+On restart, any job stuck in `'processing'` beyond `jobTimeout` is returned to `'pending'` and retried. **No job is ever silently lost.**
 
 ---
 
@@ -107,17 +132,28 @@ import { LiteQ } from 'liteq';
 
 const queue = new LiteQ({
     storagePath: './data/jobs.db', // or ':memory:' for tests
-    concurrency: 4,                // max concurrent jobs (default: 1)
+    concurrency: 4,                // max concurrent I/O jobs (default: 1)
     pollInterval: 500,             // ms between DB polls (default: 500)
     jobTimeout: 60_000,            // ms before a stuck job is released (default: 60000)
+    minWorkers: 2,                 // min idle worker threads kept alive (default: 1)
+    maxWorkers: 4,                 // max concurrent worker threads (default: 4)
 });
 ```
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `storagePath` | `string` | — | SQLite file path (`':memory:'` for tests) |
+| `concurrency` | `number` | `1` | Max concurrent I/O jobs on the main thread |
+| `pollInterval` | `number` | `500` | ms between DB polls |
+| `jobTimeout` | `number` | `60000` | ms before a stuck `'processing'` job is released |
+| `minWorkers` | `number` | `1` | Min idle workers to keep alive |
+| `maxWorkers` | `number` | `4` | Max concurrent worker threads |
 
 ---
 
 ### `queue.register()` — Register a Handler
 
-Registers a handler and returns a **typed enqueuer function**. The job type string lives only here — never repeated anywhere else in your codebase.
+Registers a handler and returns a **typed enqueuer function**. The job type string lives only here — never repeated.
 
 #### I/O Bound (async callback)
 
@@ -133,9 +169,13 @@ const sendEmail = queue.register<{ email: string; templateId: string }>(
 );
 ```
 
+`register()` detects the function argument and marks this job with `type = 'io'` in the DB. Concurrency is managed by the `concurrency` counter — these run on the main thread.
+
 #### CPU Bound (worker thread)
 
-Pass a file path instead of a callback. LiteQ detects the string and automatically spawns a `worker_thread`, keeping your main event loop completely unblocked.
+Pass a file path instead of a callback. LiteQ detects the string, resolves it to an absolute path, and marks the job with `type = 'worker'`. It runs in the generic worker pool, keeping the main event loop unblocked.
+
+Write a **handler module** — a file that exports a default async function. No `worker_threads` API needed.
 
 ```typescript
 const generatePdf = queue.register('generate-pdf', './workers/pdf-worker.js');
@@ -143,17 +183,13 @@ const generatePdf = queue.register('generate-pdf', './workers/pdf-worker.js');
 
 ```typescript
 // workers/pdf-worker.js — runs in an isolated CPU thread
-import { parentPort } from 'worker_threads';
-
-parentPort.on('message', async (job) => {
-    try {
-        const url = await buildAndUploadPdf(job.data);
-        parentPort.postMessage({ status: 'success', result: { url } });
-    } catch (err) {
-        parentPort.postMessage({ status: 'error', error: err.message });
-    }
-});
+export default async function (job) {
+    const url = await buildAndUploadPdf(job.data);
+    return { url };
+}
 ```
+
+Handler modules are dynamically imported by LiteQ's generic worker. Any idle thread can run any handler — the pool is not coupled to paths. Throw inside the handler and the error automatically propagates to LiteQ's retry logic.
 
 **The `job` object passed to your handler:**
 
@@ -180,15 +216,18 @@ await checkTrialExpiry({ userId: 'usr_9011' }, { delay: 60 * 60 * 1000 });
 
 // With custom retry config — retries at 1s → 2s → 4s → 8s → 16s
 await syncLedger({ transactionId: 'ch_3Mv1' }, { maxRetries: 5 });
+
+// With priority — runs before lower-priority jobs
+await sendAlert(data, { priority: 100 });
 ```
 
 **Options:**
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `delay` | `number` | `0` | Milliseconds before the job becomes eligible to run |
-| `maxRetries` | `number` | `3` | Max retry attempts before the job is marked failed |
-| `priority` | `number` | `10` | Higher value = higher priority *(v1.2+)* |
+| `delay` | `number` | `0` | Milliseconds before the job becomes eligible |
+| `maxRetries` | `number` | `3` | Max retry attempts before permanent failure |
+| `priority` | `number` | `10` | Higher value = runs first |
 
 ---
 
@@ -197,7 +236,7 @@ await syncLedger({ transactionId: 'ch_3Mv1' }, { maxRetries: 5 });
 ```typescript
 await queue.start();  // Begin polling — call once at boot
 
-await queue.stop();   // Graceful shutdown — finishes in-flight jobs first
+await queue.stop();   // Graceful shutdown — drains pool, finishes in-flight jobs
 
 const stats = await queue.stats();
 // { pending: 3, processing: 1, completed: 142, failed: 2, total: 148 }
@@ -262,7 +301,7 @@ await sendEmail({ to: 'user@example.com' });
 | TypeScript built-in | ✅ | ✅ | ❌ |
 | Multi-machine workers | ❌ | ✅ | ✅ |
 
-**LiteQ is the right choice when** you want BullMQ-level reliability without operating Redis. If you need workers running across multiple machines, use BullMQ.
+**LiteQ is the right choice when** you want BullMQ-level reliability without operating Redis. If you need workers across multiple machines, use BullMQ.
 
 ---
 
@@ -276,23 +315,26 @@ PRAGMA busy_timeout = 5000;     -- wait up to 5s on write contention
 PRAGMA synchronous = NORMAL;    -- crash-safe without full fsync overhead
 ```
 
+The `type` column distinguishes I/O jobs (main thread) from CPU jobs (worker thread), so each claim path queries only its own job type.
+
 ```sql
-CREATE TABLE IF NOT EXISTS liteq_jobs (
-                                          id          TEXT     PRIMARY KEY,
-                                          type        TEXT     NOT NULL,
-                                          payload     TEXT     NOT NULL,
-                                          status      TEXT     NOT NULL DEFAULT 'pending',
-                                          attempts    INTEGER  DEFAULT 0,
-                                          max_retries INTEGER  DEFAULT 3,
-                                          priority    INTEGER  DEFAULT 10,
-                                          run_at      INTEGER  NOT NULL,   -- epoch ms, eligible run time
-                                          locked_at   INTEGER,             -- set when status = 'processing'
-                                          error_log   TEXT
+CREATE TABLE liteq_jobs (
+    id          TEXT     PRIMARY KEY,
+    name        TEXT     NOT NULL,         -- job type name: 'send-email', 'resize-image', etc.
+    type        TEXT     NOT NULL,         -- execution type: 'io' or 'worker'
+    payload     TEXT     NOT NULL,
+    status      TEXT     NOT NULL DEFAULT 'pending',
+    attempts    INTEGER  DEFAULT 0,
+    max_retries INTEGER  DEFAULT 3,
+    priority    INTEGER  DEFAULT 10,
+    run_at      INTEGER  NOT NULL,         -- epoch ms, eligible run time
+    locked_at   INTEGER,                   -- set when status = 'processing'
+    error_log   TEXT
 );
 
 -- Prevents full table scans during high-frequency polling
 CREATE INDEX IF NOT EXISTS idx_liteq_polling
-    ON liteq_jobs (status, run_at, priority DESC);
+    ON liteq_jobs (status, type, run_at, priority DESC);
 ```
 
 ---
@@ -300,12 +342,7 @@ CREATE INDEX IF NOT EXISTS idx_liteq_polling
 ## Roadmap
 
 ### ✅ v1.0 — Core Engine
-SQLite WAL persistence · Atomic job locking · Async handler execution · Worker thread isolation · Exponential backoff · Delayed scheduling · Graceful shutdown
-
-### 🔜 v1.2 — Priority Queues
-```typescript
-await sendAlert(data, { priority: 100 }); // runs before lower-priority jobs
-```
+SQLite WAL persistence · Atomic job locking · I/O + CPU concurrency separation · Generic worker pool with minWorkers/maxWorkers lifecycle · Expotential backoff · Delayed scheduling · Priority queues · Graceful shutdown · Handler modules (no `worker_threads` boilerplate)
 
 ### 🔜 v1.5 — Cron Scheduling
 ```typescript
@@ -332,9 +369,6 @@ Yes. WAL mode supports concurrent readers and `BEGIN IMMEDIATE TRANSACTION` ensu
 
 **What happens if my app crashes mid-job?**
 Any job stuck in `'processing'` beyond `jobTimeout` is automatically returned to `'pending'` on the next restart. Nothing is lost.
-
-**Is it really zero-dependency?**
-LiteQ uses `better-sqlite3` as its only runtime dependency — a native, battle-tested SQLite binding with no transitive deps of its own.
 
 **When should I use BullMQ instead?**
 When you need workers distributed across multiple machines, or throughput above tens of thousands of jobs per second. LiteQ is intentionally scoped to single-node deployments.
