@@ -15,6 +15,13 @@ Delayed scheduling · Atomic job locking · Exponential backoff · CPU thread is
 
 </div>
 
+| | |
+| :--- | :--- |
+| **Visibility** | No visibility into what's running. | You can inspect, pause, and retry jobs. |
+| **Control** | Wait for the next poll cycle. | Trigger what is available to run right now. |
+| **Performance** | No insight into execution time. | See exactly how much time each job takes. |
+| **History** | Jobs are gone once processed. | Full history of completed and failed jobs. |
+
 ---
 
 ## Why LiteQ?
@@ -162,12 +169,16 @@ Registers a handler and returns a **typed enqueuer function**. The job type stri
 
 #### I/O Bound (async callback)
 
-Use for anything that waits on the network: emails, webhooks, API calls.
+Use for state-changing operations that **must** be durable: sending emails, SMS, processing payments, or triggering webhooks. These are tasks where you need at-least-once delivery and built-in retry logic to ensure the work is eventually completed without being "lost" or manually retried.
+
+Avoid using this for simple, read-only `fetch` calls that don't require persistence or crash recovery.
 
 ```typescript
 const sendEmail = queue.register<{ email: string; templateId: string }>(
     'send-transactional-email',
     async (job) => {
+        // LiteQ ensures this runs at-least-once. 
+        // For critical side-effects like emails, ensure your handler is idempotent.
         await emailProvider.send(job.data.email, job.data.templateId);
         return { sent: true };
     }
