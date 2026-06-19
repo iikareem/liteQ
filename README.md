@@ -4,10 +4,11 @@
 
 **A persistent, zero-infrastructure task queue for Node.js — powered by SQLite.**
 
-[![npm version](https://img.shields.io/badge/npm-v1.0.0-CB3837?logo=npm)](https://npmjs.com/package/liteq)
+[![GitHub](https://img.shields.io/badge/GitHub-iikareem/liteQ-181717?logo=github)](https://github.com/iikareem/liteQ)
 [![node](https://img.shields.io/badge/node-%3E%3D18.0.0-339933?logo=nodedotjs)](https://nodejs.org)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-ready-3178C6?logo=typescript)](https://www.typescriptlang.org)
+[![npm](https://img.shields.io/badge/npm-v1.0.0-CB3837?logo=npm)](https://github.com/iikareem/liteQ)
 
 Delayed scheduling · Atomic job locking · Exponential backoff · CPU thread isolation
 
@@ -397,6 +398,13 @@ When you need workers distributed across multiple machines, or throughput above 
 
 **Is TypeScript required?**
 No — works with plain JavaScript too. TypeScript types are bundled; no separate `@types` package needed.
+
+---
+
+## Links
+
+- **Source:** [github.com/iikareem/liteQ](https://github.com/iikareem/liteQ)
+- **Issues:** [github.com/iikareem/liteQ/issues](https://github.com/iikareem/liteQ/issues)
 
 ---
 
