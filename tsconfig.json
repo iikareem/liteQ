@@ -22,5 +22,5 @@
     "resolveJsonModule": true
   },
   "include": ["src"],
-  "exclude": ["node_modules", "dist", "test"]
+  "exclude": ["node_modules", "dist", "test", "src/manual.ts", "src/worker-pool.test.ts"]
 }

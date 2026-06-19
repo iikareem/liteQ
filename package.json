@@ -16,6 +16,7 @@
   },
   "scripts": {
     "build": "tsc && cp src/generic-worker.js dist/generic-worker.js",
+    "prebuild": "rm -rf dist",
     "typecheck": "tsc --noEmit",
     "test": "node --test",
     "manual": "tsx src/manual.ts",
