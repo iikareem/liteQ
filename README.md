@@ -8,7 +8,7 @@
 [![node](https://img.shields.io/badge/node-%3E%3D18.0.0-339933?logo=nodedotjs)](https://nodejs.org)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-ready-3178C6?logo=typescript)](https://www.typescriptlang.org)
-[![npm](https://img.shields.io/badge/npm-v1.0.0-CB3837?logo=npm)](https://github.com/iikareem/liteQueue)
+[![npm](https://img.shields.io/badge/npm-v1.0.1-CB3837?logo=npm)](https://www.npmjs.com/package/@iikareem/liteQueue)
 
 Delayed scheduling · Atomic job locking · Exponential backoff · CPU thread isolation
 
@@ -59,7 +59,7 @@ Your App
 ## Install
 
 ```bash
-npm install liteQueue
+npm install @iikareem/liteQueue
 ```
 
 **Requirements:** Node.js ≥ 18.0.0
@@ -69,7 +69,7 @@ npm install liteQueue
 ## Quick Start
 
 ```typescript
-import { LiteQ } from 'liteQueue';
+import { LiteQ } from '@iikareem/liteQueue';
 
 const queue = new LiteQ({ storagePath: './jobs.db' });
 
@@ -143,7 +143,7 @@ On restart, any job stuck in `'processing'` beyond `jobTimeout` is returned to `
 ### Initialization
 
 ```typescript
-import { LiteQ } from 'liteQueue';
+import { LiteQ } from '@iikareem/liteQueue';
 
 const queue = new LiteQ({
     storagePath: './data/jobs.db', // or ':memory:' for tests
@@ -274,7 +274,7 @@ await queue.purge({ olderThan: 7 * 24 * 60 * 60 * 1000 });
 
 ```typescript
 // queue.ts — create the instance once
-import { LiteQ } from 'liteQueue';
+import { LiteQ } from '@iikareem/liteQueue';
 export const queue = new LiteQ({ storagePath: './jobs.db' });
 ```
 
