@@ -32,6 +32,7 @@
     "access": "public"
   },
   "dependencies": {
-    "better-sqlite3": "^12.10.0"
+    "better-sqlite3": "^12.10.0",
+    "cron-parser": "^5.6.1"
   }
 }
