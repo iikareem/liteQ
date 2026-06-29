@@ -7,3 +7,14 @@ export type {
     QueueStats,
     JobHandler,
 } from './types.js';
+export type {
+    CronHandle,
+    CronJob,
+    CronExecution,
+    CronOptions,
+    CronOptionsFor,
+    CronExecutionQuery,
+    CronStats,
+    CronJobSummary,
+    CronPurgeOptions,
+} from './cron/types.js';
