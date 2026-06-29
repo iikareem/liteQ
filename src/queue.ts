@@ -1,6 +1,10 @@
 import {randomUUID} from 'node:crypto';
 import os from 'node:os';
 import {resolve} from 'node:path';
+import {CronDB} from './cron/db.js';
+import {CronHandleImpl} from './cron/handle.js';
+import {nextRunAfter} from './cron/parser.js';
+import type {ClaimedCronExecution, CronHandle, CronOptions, CronOptionsFor} from './cron/types.js';
 import type {ClaimedJob, ExecType} from './db.js';
 import {DB} from './db.js';
 import type {EnqueueOptions, Enqueuer, Job, JobHandler, LiteQOptions, PurgeOptions, QueueStats,} from './types.js';
@@ -16,6 +20,7 @@ const DEFAULT_PRIORITY = 10;
 
 export class LiteQ {
     private readonly db: DB;
+    private readonly cronDb: CronDB;
     private readonly handlers = new Map<string, JobHandler | string>();
     private readonly concurrency: number;
     private readonly pollInterval: number;
@@ -26,6 +31,7 @@ export class LiteQ {
 
     constructor(options: LiteQOptions) {
         this.db = new DB(options.storagePath);
+        this.cronDb = new CronDB(options.storagePath);
 
         this.concurrency = options.concurrency ?? DEFAULT_CONCURRENCY;
         this.pollInterval = options.pollInterval ?? DEFAULT_POLL_INTERVAL;
@@ -48,6 +54,22 @@ export class LiteQ {
         this.handlers.set(type, handlerOrPath as JobHandler);
         return (data: T, options?: EnqueueOptions) =>
             this.enqueue(type, data, options, 'io');
+    }
+
+    cron<T>(name: string, expression: string, handler: JobHandler<T>, options?: CronOptionsFor<T>): CronHandle;
+    cron<T>(name: string, expression: string, workerPath: string, options?: CronOptionsFor<T>): CronHandle;
+    cron<T>(
+        name: string,
+        expression: string,
+        handlerOrPath: JobHandler<T> | string,
+        options?: CronOptionsFor<T>,
+    ): CronHandle {
+        const execType: ExecType = typeof handlerOrPath === 'string' ? 'worker' : 'io';
+        const handler = execType === 'worker'
+            ? resolve(handlerOrPath as string)
+            : (handlerOrPath as JobHandler);
+
+        return this.registerCron(name, expression, handler, execType, options);
     }
 
     async start(): Promise<void> {
@@ -82,6 +104,120 @@ export class LiteQ {
 
     async purge(options: PurgeOptions): Promise<void> {
         this.db.purge(options.olderThan);
+    }
+
+    private registerCron(
+        name: string,
+        expression: string,
+        handler: JobHandler | string,
+        execType: ExecType,
+        options?: CronOptions,
+    ): CronHandle {
+        this.handlers.set(name, handler);
+
+        const now = Date.now();
+        const nextRunAt = nextRunAfter(expression, now);
+        const existing = this.cronDb.getCronJobByName(name);
+
+        this.cronDb.upsertCronJob({
+            id: existing?.id ?? randomUUID(),
+            name,
+            cronExpression: expression,
+            type: execType,
+            payload: JSON.stringify(options?.payload ?? {}),
+            enabled: options?.enabled === false ? 0 : 1,
+            maxRetries: options?.maxRetries ?? DEFAULT_MAX_RETRIES,
+            nextRunAt,
+            createdAt: existing?.createdAt ?? now,
+            updatedAt: now,
+        });
+
+        return new CronHandleImpl(name, expression, this.cronDb, {
+            trigger: () => this.triggerCron(name),
+            pause: () => this.pauseCron(name),
+            resume: () => this.resumeCron(name),
+        });
+    }
+
+    private async triggerCron(name: string) {
+        const cronJob = this.cronDb.getCronJobByName(name);
+        if (!cronJob) {
+            throw new Error(`Cron job not found: ${name}`);
+        }
+        if (!cronJob.enabled) {
+            throw new Error(`Cron job is paused: ${name}`);
+        }
+
+        const executionId = randomUUID();
+        const now = Date.now();
+        const claimed = this.cronDb.beginManualExecution(cronJob, executionId, now);
+        if (!claimed) {
+            throw new Error(`Cron job already running: ${name}`);
+        }
+
+        await this.runCronExecution(claimed);
+
+        const execution = this.cronDb.getExecutionById(executionId);
+        if (!execution) {
+            throw new Error(`Cron execution not found: ${executionId}`);
+        }
+
+        return execution;
+    }
+
+    private async pauseCron(name: string): Promise<void> {
+        const now = Date.now();
+        this.cronDb.setCronJobEnabled(name, false, now);
+    }
+
+    private async resumeCron(name: string): Promise<void> {
+        const now = Date.now();
+        this.cronDb.setCronJobEnabled(name, true, now);
+    }
+
+    private async runCronExecution(claimed: ClaimedCronExecution): Promise<void> {
+        let current = claimed;
+
+        while (true) {
+            const handler = this.handlers.get(current.name);
+            if (!handler) {
+                const now = Date.now();
+                this.cronDb.failExecution(
+                    current.executionId,
+                    `No handler registered for cron: ${current.name}`,
+                    now,
+                    now - current.startedAt,
+                );
+                return;
+            }
+
+            const job = toJobFromCron(current);
+
+            try {
+                await this.withTimeout(this.executeHandler(handler, job), this.jobTimeout);
+                const now = Date.now();
+                this.cronDb.completeExecution(current.executionId, now, now - current.startedAt);
+                return;
+            } catch (err) {
+                const errorMsg = err instanceof Error ? err.message : String(err);
+
+                if (current.attempts < current.maxRetries) {
+                    this.cronDb.retryExecution(current.executionId);
+                    const now = Date.now();
+                    this.cronDb.startExecution(current.executionId, now);
+                    current = {
+                        ...current,
+                        attempts: current.attempts + 1,
+                        startedAt: now,
+                    };
+                    continue;
+                }
+
+                const now = Date.now();
+                this.cronDb.failExecution(current.executionId, errorMsg, now, now - current.startedAt);
+                return;
+            }
+        }
     }
 
     private async enqueue<T>(
@@ -199,6 +335,17 @@ function toJob(claimed: ClaimedJob, data: unknown): Job {
         id: claimed.id,
         taskType: claimed.name,
         data,
+        attempts: claimed.attempts,
+        maxRetries: claimed.maxRetries,
+        status: 'processing',
+    };
+}
+
+function toJobFromCron(claimed: ClaimedCronExecution): Job {
+    return {
+        id: claimed.executionId,
+        taskType: claimed.name,
+        data: JSON.parse(claimed.payload),
         attempts: claimed.attempts,
         maxRetries: claimed.maxRetries,
         status: 'processing',
