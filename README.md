@@ -8,7 +8,7 @@
 [![node](https://img.shields.io/badge/node-%3E%3D18.0.0-339933?logo=nodedotjs)](https://nodejs.org)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-ready-3178C6?logo=typescript)](https://www.typescriptlang.org)
-[![npm](https://img.shields.io/badge/npm-v1.0.3-CB3837?logo=npm)](https://www.npmjs.com/package/@km-dev/lite-q)
+[![npm](https://img.shields.io/badge/npm-v1.1.0-CB3837?logo=npm)](https://www.npmjs.com/package/@km-dev/lite-q)
 
 Delayed scheduling · Cron jobs · Atomic job locking · Exponential backoff · CPU thread isolation
 
